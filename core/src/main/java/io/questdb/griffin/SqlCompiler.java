@@ -29,6 +29,7 @@ import io.questdb.cairo.*;
 import io.questdb.cairo.sql.*;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
+import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.cutlass.text.Atomicity;
 import io.questdb.cutlass.text.TextException;
 import io.questdb.cutlass.text.TextLoader;
@@ -146,6 +147,7 @@ public class SqlCompiler implements Closeable {
         final KeywordBasedExecutor dropTable = this::dropTable;
         final KeywordBasedExecutor sqlBackup = this::sqlBackup;
         final KeywordBasedExecutor sqlShow = this::sqlShow;
+        final KeywordBasedExecutor touchTable = this::touchTable;
 
         keywordBasedExecutors.put("truncate", truncateTables);
         keywordBasedExecutors.put("TRUNCATE", truncateTables);
@@ -169,6 +171,8 @@ public class SqlCompiler implements Closeable {
         keywordBasedExecutors.put("BACKUP", sqlBackup);
         keywordBasedExecutors.put("show", sqlShow);
         keywordBasedExecutors.put("SHOW", sqlShow);
+        keywordBasedExecutors.put("touch", touchTable);
+        keywordBasedExecutors.put("TOUCH", touchTable);
 
         configureLexer(lexer);
 
@@ -2319,6 +2323,122 @@ public class SqlCompiler implements Closeable {
         } finally {
             tableNames.clear();
         }
+    }
+
+    private CompiledQuery touchTable(SqlExecutionContext executionContext) throws SqlException {
+        CharSequence tok;
+        tok = expectToken(lexer, "'table'");
+
+        if (SqlKeywords.isTableKeyword(tok)) {
+            final int tableNamePosition = lexer.getPosition();
+
+            tok = GenericLexer.unquote(expectToken(lexer, "table name"));
+
+            tableExistsOrFail(tableNamePosition, tok, executionContext);
+
+            CharSequence tableName = GenericLexer.immutableOf(tok);
+            try (TableReader reader = engine.getReader(executionContext.getCairoSecurityContext(), tableName);
+                 DirectLongList columnIndexes = new DirectLongList(32)) {
+                final TableReaderMetadata metadata = reader.getMetadata();
+                tok = expectToken(lexer, "'columns'");
+
+                if (SqlKeywords.isColumnsKeyword(tok)) {
+                    do {
+                        CharSequence tk = GenericLexer.unquote(expectToken(lexer, "column name"));
+                        final int columnIndex = metadata.getColumnIndexQuiet(tk);
+                        if (columnIndex == -1) {
+                            throw SqlException.invalidColumn(lexer.lastTokenPosition(), tk);
+                        }
+
+                        tk = SqlUtil.fetchNext(lexer);
+
+                        if (tk == null) {
+                            break;
+                        }
+
+                        if (SqlKeywords.isIndexKeyword(tk)) {
+                            if (metadata.isColumnIndexed(columnIndex)) {
+                                columnIndexes.add(-columnIndex); // negative value encodes index pre touch
+                            } else {
+                                columnIndexes.add(columnIndex);
+                            }
+                            tk = SqlUtil.fetchNext(lexer);
+                            if (tk == null) {
+                                break;
+                            }
+                        } else {
+                            columnIndexes.add(columnIndex);
+                        }
+
+                        if (!Chars.equals(tk, ',')) {
+                            throw SqlException.$(lexer.lastTokenPosition(), "',' expected");
+                        }
+                    } while (true);
+                } else {
+                    throw SqlException.$(lexer.lastTokenPosition(), "'columns' expected");
+                }
+
+                FullBwdDataFrameCursor frameCursor = new FullBwdDataFrameCursor();
+                frameCursor.of(reader);
+                DataFrame frame;
+                long garbage = 0;
+                final int pageSize = Unsafe.getUnsafe().pageSize();
+
+                while ((frame = frameCursor.next()) != null) {
+
+                    final int partitionIndex = frame.getPartitionIndex();
+                    final int columnBase = reader.getColumnBase(partitionIndex);
+
+                    for (long column = 0, sz = columnIndexes.size(); column < sz; column++) {
+
+                        int columnIndex = (int)columnIndexes.get(column);
+                        final boolean touchIndex = columnIndex < 0;
+                        columnIndex = Math.abs(columnIndex);
+
+                        final int primaryColumnIndex = TableReader.getPrimaryColumnIndex(columnBase, columnIndex);
+                        final MemoryR columnMemory = reader.getColumn(primaryColumnIndex);
+
+                        final long columnMemorySize = columnMemory.size();
+                        final long columnBaseAddress = columnMemory.getPageAddress(0);
+                        final long columnPageCount = (columnMemorySize + pageSize - 1) / pageSize;
+
+                        for (long i = 0; i < columnPageCount; i++) {
+                            final byte v = Unsafe.getUnsafe().getByte(columnBaseAddress + i * pageSize);
+                            garbage += v;
+                        }
+
+                        if (touchIndex) {
+                            final BitmapIndexReader indexReader = frame.getBitmapIndexReader(columnIndex, BitmapIndexReader.DIR_BACKWARD);
+
+                            final long keyBaseAddress = indexReader.getKeyBaseAddress();
+                            final long keyMemorySize = indexReader.getKeyMemorySize();
+                            final long keyPageCount = (keyMemorySize + pageSize - 1) / pageSize;
+
+                            for (long i = 0; i < keyPageCount; i++) {
+                                final byte v = Unsafe.getUnsafe().getByte(keyBaseAddress + i * pageSize);
+                                garbage += v;
+                            }
+
+                            final long valueBaseAddress = indexReader.getValueBaseAddress();
+                            final long valueMemorySize = indexReader.getValueMemorySize();
+                            final long valuePageCount = (valueMemorySize + pageSize - 1) / pageSize;
+
+                            for (long i = 0; i < valuePageCount; i++) {
+                                final byte v = Unsafe.getUnsafe().getByte(valueBaseAddress + i * pageSize);
+                                garbage += v;
+                            }
+                        }
+                    }
+                    LOG.info().$("[table=").$(tableName).$(", touched=").$(garbage).$();
+                }
+            } catch (CairoException e) {
+                LOG.info().$("could not touch table [table=").$(tableName).$(", ex=").$((Sinkable) e).$();
+                throw SqlException.$(tableNamePosition, "table '").put(tableName).put("' could not be touched: ").put(e);
+            }
+        } else {
+            throw SqlException.$(lexer.lastTokenPosition(), "'table' expected");
+        }
+        return compiledQuery.ofAlter();
     }
 
     private void tableExistsOrFail(int position, CharSequence tableName, SqlExecutionContext executionContext) throws SqlException {
